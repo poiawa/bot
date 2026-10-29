@@ -1,39 +1,26 @@
 import { FastifyInstance } from 'fastify';
+import { getDashboardStats } from '../modules/reporting/dashboard.js';
+import { testConnection } from '../core/database/index.js';
+import { testRedisConnection } from '../core/redis/index.js';
 
 export default async function adminRoutes(app: FastifyInstance) {
-  // Dashboard stats
-  app.get('/dashboard', { preHandler: [app.adminOnly] }, async (request, reply) => {
+  // System health (real checks)
+  app.get('/system/health', { preHandler: [app.adminOnly] }, async () => {
+    const [dbOk, redisOk] = await Promise.all([testConnection(), testRedisConnection()]);
     return {
       success: true,
       data: {
-        totalUsers: 0,
-        totalSubscriptions: 0,
-        activeSubscriptions: 0,
-        totalRevenue: 0,
-        pendingPayments: 0,
-        openTickets: 0,
-        salesToday: 0,
-        salesThisWeek: 0,
-        salesThisMonth: 0,
-        topProducts: [],
-        topServers: [],
-      },
-    };
-  });
-
-  // System health
-  app.get('/system/health', { preHandler: [app.adminOnly] }, async (request, reply) => {
-    return {
-      success: true,
-      data: {
-        database: 'ok',
-        redis: 'ok',
+        database: dbOk ? 'ok' : 'failed',
+        redis: redisOk ? 'ok' : 'failed',
         panels: [],
-        servers: [],
-        jobs: [],
         lastBackup: null,
       },
     };
+  });
+  // Dashboard stats (real, from ledger/orders/subscriptions)
+  app.get('/dashboard', { preHandler: [app.adminOnly] }, async (request, reply) => {
+    const stats = await getDashboardStats();
+    return { success: true, data: stats };
   });
 
   // Audit logs
