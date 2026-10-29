@@ -203,9 +203,20 @@ export async function startBotPolling(
     process.once('SIGTERM', () => stop('SIGTERM'));
   });
 
-  // Launch and await the promise — only log success after confirmation.
+  // Launch long-polling. NOTE: telegraf's bot.launch() internally awaits an
+  // INFINITE polling loop that only settles on bot.stop(), so we must NOT await
+  // it or the success log would never fire and our shutdown wiring would never
+  // run. Instead: verify the token first (getMe throws 401 if invalid), then
+  // start polling fire-and-forget and capture any rejection.
   try {
-    await bot.launch();
+    await bot.telegram.getMe();
+    log.info('Telegram bot token verified');
+    bot.launch().catch((err) => {
+      const maskedError = err instanceof Error
+        ? err.message.replace(token, '[TOKEN MASKED]')
+        : String(err);
+      log.error({ err: maskedError }, 'Telegram bot polling loop ended or failed to start (see above)');
+    });
     log.info('Telegram bot polling started successfully');
   } catch (err) {
     // Never log the token. Mask it in error reports.
