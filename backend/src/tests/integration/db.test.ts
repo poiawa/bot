@@ -110,3 +110,49 @@ describe('database integration', () => {
     expect(outScope.length).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Telegram identity race-safety against a REAL test database. Uses the REAL
+// identityRepo (transaction + rollback on 23505 + re-read winner). Skipped
+// honestly when no PostgreSQL test database is reachable.
+// ---------------------------------------------------------------------------
+describe('telegram identity integration (real repo, real test DB)', () => {
+  // Point the production db at the disposable test database BEFORE importing the
+  // module so identityRepo binds here instead of a real one. Skipped when absent.
+  process.env.DATABASE_URL = url;
+  dbIt('re-run /start + concurrent same telegram_id => exactly ONE user + ONE identity', async () => {
+    const mod = await import('../../modules/identity/telegram-user.js');
+    const tgId = `${crypto.randomUUID()}`;
+    const [a, b] = await Promise.all([
+      mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: tgId, first_name: 'ItUser' }),
+      mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: tgId, first_name: 'ItUser' }),
+    ]);
+    expect(a).toBe(b);
+    const identityCount = await q(
+      `SELECT count(*)::int c FROM telegram_identities WHERE telegram_id=$1`, [tgId]
+    );
+    expect(identityCount[0].c).toBe(1);
+    const usersAfter = await q(`SELECT count(*)::int c FROM users WHERE id=$1`, [a]);
+    expect(usersAfter[0].c).toBe(1);
+  });
+
+  dbIt('re-running /start never creates a NEW user for an existing telegram_id', async () => {
+    const mod = await import('../../modules/identity/telegram-user.js');
+    const tgId = `${crypto.randomUUID()}`;
+    const id1 = await mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: tgId });
+    const id2 = await mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: tgId });
+    expect(id2).toBe(id1);
+    const cnt = await q(`SELECT count(*)::int c FROM telegram_identities WHERE telegram_id=$1`, [tgId]);
+    expect(cnt[0].c).toBe(1);
+  });
+
+  dbIt('does NOT rewrite an existing user when the identity already existed', async () => {
+    const mod = await import('../../modules/identity/telegram-user.js');
+    const id = await mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: 'existing', first_name: 'first' });
+    const row = (await q(`SELECT id, first_name FROM users WHERE id=$1`, [id]))[0];
+    const after = await mod.findOrCreateUserFromTelegram(mod.identityRepo, { id: 'existing' });
+    expect(after).toBe(id);
+    const row2 = (await q(`SELECT id, first_name FROM users WHERE id=$1`, [id]))[0];
+    expect(row2.first_name).toBe('first');
+  });
+});

@@ -10,7 +10,7 @@
  * Modes: polling (enabled by TELEGRAM_POLLING=true) or disabled.
  * Webhook mode is prepared (createBotForWebhook) but not wired yet.
  */
-import { Telegraf, Context } from 'telegraf';
+import { Telegraf, Context, TelegramError } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { logger } from '../core/logger/index.js';
 import { fa } from './texts.js';
@@ -19,51 +19,67 @@ import { db } from '../core/database/index.js';
 import { users, products, productPrices, wallets, telegramIdentities, subscriptions } from '../core/database/schema.js';
 import { eq, and } from 'drizzle-orm';
 import { formatPrice } from '../core/utils/index.js';
+import {
+  findOrCreateUserFromTelegram,
+  identityRepo,
+  isBlockedByUserError,
+  type TelegramProfile,
+} from '../modules/identity/telegram-user.js';
 
 const log = logger.child({ module: 'telegram-bot' });
 
+/** Reply extra parameter accepted by Telegraf (keyboards, parse mode, …). */
+type ReplyExtra = Parameters<Context['reply']>[1];
+
+/**
+ * Send a reply but NEVER let a send error break the handler or become an
+ * "Unhandled error while processing". 403 (user blocked the bot) is logged as
+ * a quiet warning; other send errors are logged and swallowed.
+ */
+async function safeReply(ctx: Context, text: string, extra?: ReplyExtra): Promise<void> {
+  try {
+    await ctx.reply(text, extra);
+  } catch (err) {
+    if (isBlockedByUserError(err)) {
+      log.warn({ tgId: ctx.from?.id }, 'Telegram reply skipped — user blocked the bot');
+      return;
+    }
+    log.error({ err: err instanceof Error ? err.message : String(err), tgId: ctx.from?.id }, 'Telegram send failed (handler continues)');
+  }
+}
+
+/** Create the bot, registering a global error handler so no handler error ever kills polling. */
 function createBot(token: string): Telegraf<Context> {
   const bot = new Telegraf(token);
 
-  // Start command
+  bot.catch((err, ctx) => {
+    if (isBlockedByUserError(err)) {
+      log.warn({ tgId: ctx?.from?.id }, 'handled: user blocked the bot');
+      return;
+    }
+    const code = err instanceof TelegramError ? err.code : undefined;
+    const desc = err instanceof Error ? err.message : String(err);
+    log.error({ code, err: desc, tgId: ctx?.from?.id }, 'unhandled bot error (polling continues)');
+  });
+
+
+  // Start command — idempotent & race-safe identity resolution
   bot.start(async (ctx) => {
     const tgUser = ctx.from;
     if (!tgUser) return;
+    const profile: TelegramProfile = {
+      id: tgUser.id,
+      username: tgUser.username,
+      first_name: tgUser.first_name,
+      last_name: tgUser.last_name,
+    };
 
     try {
-      // Find or create user + telegram identity (idempotent)
-      const identity = await db
-        .select()
-        .from(telegramIdentities)
-        .where(eq(telegramIdentities.telegramId, String(tgUser.id)))
-        .limit(1);
-
-      let userId: string;
-      if (identity.length) {
-        userId = identity[0].userId;
-      } else {
-        const newUser = await db
-          .insert(users)
-          .values({
-            firstName: tgUser.first_name,
-            lastName: tgUser.last_name,
-          })
-          .returning();
-        userId = newUser[0].id;
-        await db.insert(telegramIdentities).values({
-          userId,
-          telegramId: String(tgUser.id),
-          username: tgUser.username,
-          firstName: tgUser.first_name,
-          lastName: tgUser.last_name,
-        });
-        await db.insert(wallets).values({ userId }).onConflictDoNothing();
-      }
-
-      await ctx.reply(fa.welcome, mainMenuKeyboard());
+      await findOrCreateUserFromTelegram(identityRepo, profile);
+      await safeReply(ctx, fa.welcome, mainMenuKeyboard());
     } catch (err) {
-      log.error({ err }, 'start handler failed');
-      await ctx.reply(fa.errors.generic);
+      log.error({ err: err instanceof Error ? err.message : String(err) }, 'start handler failed');
+      await safeReply(ctx, fa.errors.generic);
     }
   });
 
