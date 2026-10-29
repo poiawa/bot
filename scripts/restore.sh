@@ -28,6 +28,13 @@ fi
 echo "[INFO] Stopping backend and worker to prevent writes..."
 docker compose stop backend worker || true
 
+# Safety net: snapshot the CURRENT database before overwriting it
+PRE_TS="$(date +%Y%m%d_%H%M%S)"
+echo "[INFO] Backing up current database to db_pre_restore_$PRE_TS.sql.gz (safety)..."
+docker compose exec -T postgres pg_dump -U vpnbot -d vpnbot 2>/dev/null \
+  | gzip > "$(dirname "$BACKUP_FILE")/db_pre_restore_$PRE_TS.sql.gz" \
+  || echo "[WARN] Could not back up current database (may be empty) — continuing."
+
 echo "[INFO] Restoring database..."
 gunzip -c "$SQL_GZ" | docker compose exec -T postgres psql -U vpnbot -d vpnbot
 

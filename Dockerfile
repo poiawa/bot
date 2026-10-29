@@ -32,6 +32,10 @@ COPY --from=backend-builder /app/dist ./dist
 COPY --from=backend-builder /app/node_modules ./node_modules
 COPY --from=backend-builder /app/package*.json ./
 
+# Drizzle migrations + config (required by `npm run migrate` in-container)
+COPY backend/drizzle ./drizzle
+COPY backend/drizzle.config.ts ./drizzle.config.ts
+
 # Create directories
 RUN mkdir -p /app/uploads /app/backups && \
     chown -R vpnbot:vpnbot /app

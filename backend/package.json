@@ -35,15 +35,15 @@
     "pino-pretty": "^11.2.1",
     "qrcode": "^1.5.4",
     "telegraf": "^4.16.3",
-    "zod": "^3.23.8"
+    "tsx": "^4.16.2",
+    "zod": "^3.23.8",
+    "drizzle-kit": "^0.24.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.2",
     "@types/node": "^20.14.9",
     "@types/pg": "^8.11.6",
     "@types/qrcode": "^1.5.5",
-    "drizzle-kit": "^0.24.0",
-    "tsx": "^4.16.2",
     "typescript": "^5.5.3",
     "vitest": "^2.0.2"
   }

@@ -1,4 +1,41 @@
-# Implementation Progress — Checkpoint 3 (database & E2E readiness)
+# Implementation Progress — Checkpoint 4 (installer & deployment readiness)
+
+**Date**: 2026-10-29
+**Last verified**: installer lib tests **34/34 pass** (incl. bash -n on all 8 scripts) · configure-env smoke **10/10 pass** · backend tsc 0 errors · 20 unit + 5 DB-integration tests unchanged
+
+## Checkpoint 4 — automated installer (this session)
+
+### Fixed before hardening (verified broken state)
+1. `docker-compose.yml`: backend/worker/frontend used `context: ./backend` + `dockerfile: ../Dockerfile` — dockerfile outside build context = guaranteed build failure. Fixed to repo-root context; removed nonexistent `./backend/src/migrations` initdb mount; removed host `./frontend/dist` mounts (dist now comes from the image); added `env_file: .env` to backend/worker so JWT_SECRET/ENCRYPTION_KEY/etc. actually reach the app.
+2. `Dockerfile`: now COPYs `backend/drizzle` + `drizzle.config.ts` so `npm run migrate` works in-container; `drizzle-kit` + `tsx` moved to runtime dependencies (prod image runs `npm ci --only=production`).
+3. `nginx/nginx.conf`: `/` and `/mini-app/` now proxy to the frontend container; `nginx/frontend.conf` gained a `/health` endpoint for its compose healthcheck.
+4. `.env.example`: removed duplicate `APP_SECRET=`; `.gitignore`: added `backups/`.
+
+### New installer system (consolidates, does not duplicate)
+- `scripts/lib/common.sh` — shared tested helpers (OS classification, resource/port checks, secret generation, idempotent env upsert, placeholder detection)
+- `scripts/install.sh` — full preflight (root, Ubuntu 22.04/24.04 hard-stop, disk≥5GB, RAM, ports 80/443, existing containers), Docker install only with confirmation, interactive domain/token config, secure secret generation (never printed, `.env` chmod 600), validation gate BEFORE compose up, health wait, additive drizzle migrations, conservative UFW (only if active, only 22/80/443, verifies DB/Redis not exposed)
+- `scripts/configure-env.sh` — env creation/prompts; idempotent (re-run never clobbers real secrets)
+- `scripts/update.sh` — backup → stash-check → ff-only pull → build → migrate → restart → health; aborts leave old containers running; NO automatic migration rollback (documented)
+- `scripts/status.sh`, `scripts/logs.sh` (new), `scripts/uninstall.sh` (new: double confirmation, typed `DELETE-MY-DATA` phrase for volumes, final backup first)
+- `scripts/restore.sh` — now snapshots the CURRENT database before overwriting
+- `scripts/tests/run-tests.sh` (34 assertions) + `scripts/tests/configure-env.test.sh` (10 assertions) — run with plain bash, no Docker needed
+
+### Test results (executed on this machine, Git Bash)
+| Test | Result |
+|---|---|
+| `bash scripts/tests/run-tests.sh` | 34 passed, 0 failed |
+| `bash scripts/tests/configure-env.test.sh` | 10 passed, 0 failed |
+| `bash -n` all 8 scripts | all pass |
+| shellcheck | NOT installed here — not run (documented) |
+| `docker compose config` / real build | NOT run — no Docker on this machine (documented) |
+
+## Cumulative status
+- Checkpoints 1–3: real handlers (auth/catalog/orders/payments/wallet/subscriptions/reseller-scope/audit/admin-stats), migrations 0000+0001 consistent, integration suite (skips without DB)
+- Checkpoint 4: installer/deployment readiness as above
+
+---
+
+# Checkpoint 3 — database & E2E readiness (historical)
 
 **Date**: 2026-10-29
 **Last verified**: backend tsc = 0 errors · **20/20 unit tests pass** · 5 DB integration tests defined (skip cleanly without PostgreSQL) · frontend build OK
@@ -27,7 +64,7 @@ npm test -- src/tests/integration
 docker rm -f vpnbot-test-pg
 ```
 
-## Cumulative status
+## Checkpoint 3 status
 - Real handlers: auth (scrypt + Telegram initData HMAC), catalog, orders, payments (initiate/callback/idempotent confirm), wallet (locked ledger), subscriptions (ownership + renew), reseller scope, audit, admin dashboard stats + real health checks
 - Migration 0001: additive `users.reseller_owner_id` (FK, duplicate-safe)
 
