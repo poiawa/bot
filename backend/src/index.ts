@@ -11,6 +11,7 @@ import { logger } from './core/logger/index.js';
 import { testConnection, closePool } from './core/database/index.js';
 import { testRedisConnection, closeRedis } from './core/redis/index.js';
 import { closeQueues } from './core/queue/index.js';
+import { startBotPolling } from './telegram/bot.js';
 
 import healthRoutes from './routes/health.js';
 import authRoutes from './routes/auth.js';
@@ -185,9 +186,36 @@ async function start() {
     logger.info(`Server listening on http://${host}:${port}`);
     logger.info(`API Documentation available at http://${host}:${port}/docs`);
 
-    // Graceful shutdown
+    // --- Telegram bot: start only when TELEGRAM_POLLING=true and token is valid ---
+    let tgBot: import('telegraf').Telegraf | null = null;
+    let tgStopped: Promise<void> | null = null;
+    const pollingEnabled = process.env.TELEGRAM_POLLING === 'true';
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+
+    if (pollingEnabled) {
+      if (!botToken || !botToken.trim() || botToken.startsWith('your-') || botToken.startsWith('your_')) {
+        logger.warn('TELEGRAM_POLLING=true but TELEGRAM_BOT_TOKEN is missing or placeholder — bot NOT started. Set a valid token in .env to enable the Telegram bot.');
+      } else {
+        try {
+          const result = await startBotPolling(botToken);
+          tgBot = result.bot;
+          tgStopped = result.stopped;
+        } catch (err) {
+          // Error already logged inside startBotPolling with masked token
+          logger.warn('Telegram bot NOT started due to launch error (see above).');
+        }
+      }
+    } else {
+      logger.info('TELEGRAM_POLLING=false — Telegram bot is disabled (set true in .env to enable polling mode).');
+    }
+
+    // Graceful shutdown — one place, handles bot + app + infra
     const shutdown = async (signal: string) => {
       logger.info(`Received ${signal}, shutting down gracefully...`);
+      if (tgBot) {
+        tgBot.stop(signal);
+        if (tgStopped) await tgStopped;
+      }
       await app.close();
       await closeQueues();
       await closeRedis();
@@ -197,7 +225,7 @@ async function start() {
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGINT',  () => shutdown('SIGINT'));
 
   } catch (err) {
     logger.error({ err }, 'Failed to start server');

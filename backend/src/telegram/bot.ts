@@ -7,7 +7,8 @@
  * - Admin commands are restricted by role, checked server-side.
  * - Subscription URLs are only sent to the owning user.
  *
- * Modes: webhook (recommended for production) or long polling.
+ * Modes: polling (enabled by TELEGRAM_POLLING=true) or disabled.
+ * Webhook mode is prepared (createBotForWebhook) but not wired yet.
  */
 import { Telegraf, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -160,18 +161,52 @@ function createBot(token: string): Telegraf<Context> {
   return bot;
 }
 
-export function startBotPolling(token: string): Telegraf<Context> {
+/**
+ * Launch the bot in long-polling mode, ONLY when TELEGRAM_POLLING=true.
+ *
+ * Safety properties:
+ * - Token is validated before use (never logged on error).
+ * - Bot launches exactly once per process.
+ * - Launch errors are visible and prevent a false "started" log.
+ * - Graceful SIGINT/SIGTERM stops the bot cleanly.
+ */
+export async function startBotPolling(
+  token: string,
+  options?: { shutdownSignal?: string }
+): Promise<{ bot: Telegraf<Context>; stopped: Promise<void> }> {
   const bot = createBot(token);
-  bot.launch().catch((err) => {
-    log.error({ err }, 'bot polling failed to start');
+
+  // Register graceful stop FIRST, before launch, so signal handlers are ready.
+  const stopPromise = new Promise<void>((resolve) => {
+    const stop = (signal: string) => {
+      log.info({ signal }, 'Stopping Telegram bot...');
+      bot.stop(signal);
+      resolve();
+    };
+    process.once('SIGINT',  () => stop('SIGINT'));
+    process.once('SIGTERM', () => stop('SIGTERM'));
   });
-  log.info('Telegram bot started in polling mode');
-  // Graceful stop
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
-  return bot;
+
+  // Launch and await the promise — only log success after confirmation.
+  try {
+    await bot.launch();
+    log.info('Telegram bot polling started successfully');
+  } catch (err) {
+    // Never log the token. Mask it in error reports.
+    const maskedError = err instanceof Error
+      ? err.message.replace(token, '[TOKEN MASKED]')
+      : String(err);
+    log.error({ err: maskedError }, 'Telegram bot polling failed to start — check TELEGRAM_BOT_TOKEN is valid and bot is not already running elsewhere');
+    throw err;
+  }
+
+  return { bot, stopped: stopPromise };
 }
 
+/**
+ * Prepared for webhook use (not wired yet).
+ * Returns { bot, secretToken } — caller wires the webhook endpoint.
+ */
 export function createBotForWebhook(token: string, secretToken: string) {
   const bot = createBot(token);
   return { bot, secretToken };
