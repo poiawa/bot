@@ -1,7 +1,48 @@
-# Implementation Progress — Checkpoint 2
+# Implementation Progress — Checkpoint 3 (database & E2E readiness)
 
 **Date**: 2026-10-29
-**Last verified state**: backend `tsc --noEmit` = 0 errors, **20/20 tests pass**, frontend builds.
+**Last verified**: backend tsc = 0 errors · **20/20 unit tests pass** · 5 DB integration tests defined (skip cleanly without PostgreSQL) · frontend build OK
+
+## This checkpoint
+
+1. **Migration consistency verified offline**: `drizzle-kit generate` against current schema reports "No schema changes, nothing to migrate" — migrations 0000 + 0001 exactly match the schema. No migrations invented.
+2. **Env audit**: compared every `process.env.*` used in code against `.env.example`; added missing `HOST` and `ZARINPAL_SANDBOX`.
+3. **Integration test suite added** (`src/tests/integration/`):
+   - `helpers.ts` — SAFETY GUARDS: refuses to run against any database whose name lacks "test"; applies real migration SQL files (validates scenario 19)
+   - `db.test.ts` — 5 tests: migrations apply on fresh DB (19), scrypt roundtrip, concurrent ledger transfer balance conservation (8), duplicate `provider_ref` rejected by DB constraint (payment idempotency anchor), reseller scope SQL isolation (9)
+   - Skips cleanly when PostgreSQL unreachable — **skipped ≠ passed**
+4. **Docker/PostgreSQL/Redis unavailable on this Windows machine** — exact blocker for executing the integration suite. It runs anywhere PostgreSQL exists:
+   ```
+   set TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/vpnbot_test
+   cd backend && npm test -- src/tests/integration
+   ```
+
+## Setup instructions to execute integration tests (any machine with Docker)
+```
+docker run -d --name vpnbot-test-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=vpnbot_test -p 5432:5432 postgres:15-alpine
+cd backend
+# Windows: set TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/vpnbot_test
+# Linux/mac: export TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/vpnbot_test
+npm test -- src/tests/integration
+docker rm -f vpnbot-test-pg
+```
+
+## Cumulative status
+- Real handlers: auth (scrypt + Telegram initData HMAC), catalog, orders, payments (initiate/callback/idempotent confirm), wallet (locked ledger), subscriptions (ownership + renew), reseller scope, audit, admin dashboard stats + real health checks
+- Migration 0001: additive `users.reseller_owner_id` (FK, duplicate-safe)
+
+## Remaining (honest)
+- Execute the 5 integration tests (blocked: no Docker/PG here)
+- Live Marzban panel + Zarinpal sandbox credentials → live integration tests
+- Inventory reservation, reseller bots/settlements, notifications delivery, discounts, Mini App/customer portal UI, remaining admin handlers
+- Telegram bot purchase-flow wiring to /api/payments/initiate
+
+## Test commands & results (this machine)
+| Command | Result |
+|---|---|
+| `npm run typecheck` / tsc --noEmit | 0 errors |
+| `npx vitest run` | 20 passed, 5 skipped (integration, no DB) |
+| frontend `npx vite build` | built in ~550ms |
 
 ## Completed in this checkpoint
 
