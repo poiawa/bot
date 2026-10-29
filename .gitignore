@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Test
+coverage/
+
+# Database
+*.sql
+*.dump
+
+# Secrets (NEVER commit these)
+*.pem
+*.key
+secrets/
+credentials/
+
+!backend/drizzle/*.sql
+
+# Local build and test logs
+backend/*-log.txt
+
+# Ignore all environment variants
+.env.*
+!.env.example
