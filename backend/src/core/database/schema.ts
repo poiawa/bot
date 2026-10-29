@@ -1,5 +1,5 @@
 // Core database schema for VPN Subscription Sales Platform
-import { pgTable, pgEnum, uuid, text, timestamp, integer, boolean, jsonb } from 'drizzle-orm/pg-core';
+import { pgTable, pgEnum, uuid, text, timestamp, integer, boolean, jsonb, type AnyPgColumn } from 'drizzle-orm/pg-core';
 
 // Enums
 export const userStatusEnum = pgEnum('user_status', ['active', 'suspended', 'banned']);
@@ -26,6 +26,8 @@ export const users = pgTable('users', {
   firstName: text('first_name'),
   lastName: text('last_name'),
   avatarUrl: text('avatar_url'),
+  /** Customers registered by a reseller — scope isolation anchor */
+  resellerOwnerId: uuid('reseller_owner_id').references((): AnyPgColumn => resellers.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
   lastLoginAt: timestamp('last_login_at'),

@@ -1,130 +1,85 @@
+/**
+ * Wallet routes: balance, transaction history, transfers, gift redemption.
+ * All balance changes go through the ledger service (row-locked).
+ */
 import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { db } from '../core/database/index.js';
+import { wallets, ledgerTransactions } from '../core/database/schema.js';
+import { eq, desc } from 'drizzle-orm';
+import { ensureWallet, recordLedgerEntry, transferBetweenWallets, LedgerError } from '../modules/wallet/service.js';
+import { audit } from '../modules/audit/index.js';
 
 export default async function walletRoutes(app: FastifyInstance) {
-  // Get wallet balance
-  app.get('/balance', { preHandler: [app.authenticate] }, async (request: any, reply) => {
+  app.get('/balance', { preHandler: [app.authenticate] }, async (request: any) => {
+    const wallet = await ensureWalletFor(request.user.id);
+    return { success: true, data: { balance: wallet.balance, currency: wallet.currency, creditLimit: wallet.creditLimit } };
+  });
+
+  app.get('/transactions', { preHandler: [app.authenticate] }, async (request: any) => {
+    const q = request.query as { page?: string; limit?: string; type?: string };
+    const page = Math.max(1, Number(q.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(q.limit) || 20));
+    const wallet = await ensureWalletFor(request.user.id);
+    const rows = await db
+      .select()
+      .from(ledgerTransactions)
+      .where(eq(ledgerTransactions.walletId, wallet.id))
+      .limit(limit)
+      .offset((page - 1) * limit);
+    const totalRows = await db.select({ id: ledgerTransactions.id }).from(ledgerTransactions).where(eq(ledgerTransactions.walletId, wallet.id));
     return {
       success: true,
-      data: {
-        balance: 0,
-        currency: 'IRT',
-        creditLimit: 0,
-      },
+      data: { items: rows, total: rows.length < limit && page === 1 ? rows.length : rows.length, page, limit },
     };
   });
 
-  // Get transaction history
-  app.get('/transactions', { preHandler: [app.authenticate] }, async (request: any, reply) => {
-    const { page, limit, type } = request.query as {
-      page?: number;
-      limit?: number;
-      type?: string;
-    };
-
-    return {
-      success: true,
-      data: {
-        items: [],
-        total: 0,
-        page: page || 1,
-        limit: limit || 20,
-        totalPages: 0,
-      },
-      message: 'Get transactions not implemented yet',
-    };
-  });
-
-  // Deposit funds
-  app.post('/deposit', { preHandler: [app.authenticate] }, async (request: any, reply) => {
-    const { amount, paymentMethod } = request.body as {
-      amount: number;
-      paymentMethod: string;
-    };
-
-    return {
-      success: true,
-      data: {
-        depositId: `DEP-${Date.now()}`,
-        amount,
-        paymentUrl: 'https://payment.example.com/deposit/xxx',
-      },
-      message: 'Deposit not implemented yet',
-    };
-  });
-
-  // Transfer to another user
+  // Transfer to another user (atomic, locked)
   app.post('/transfer', { preHandler: [app.authenticate] }, async (request: any, reply) => {
-    const { toUserId, amount, description } = request.body as {
-      toUserId: string;
-      amount: number;
-      description?: string;
-    };
-
-    return {
-      success: true,
-      data: null,
-      message: 'Transfer not implemented yet',
-    };
+    const parsed = z
+      .object({
+        toUserId: z.string().uuid(),
+        amount: z.number().int().positive().max(1_000_000_000),
+        description: z.string().max(300).optional(),
+      })
+      .safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ success: false, error: 'Invalid input' });
+    }
+    const { toUserId, amount, description } = parsed.data;
+    if (toUserId === request.user.id) {
+      return reply.status(400).send({ success: false, error: 'Cannot transfer to yourself' });
+    }
+    try {
+      const fromWallet = await ensureWalletFor(request.user.id);
+      const toWallet = await ensureWalletFor(toUserId);
+      const result = await transferBetweenWallets({
+        fromWalletId: fromWallet.id,
+        toWalletId: toWallet.id,
+        amount,
+        description,
+        createdBy: request.user.id,
+      });
+      await audit({
+        userId: request.user.id,
+        action: 'wallet.transfer',
+        entity: 'wallet',
+        entityId: fromWallet.id,
+        newData: { toUserId, amount, description },
+      });
+      return { success: true, data: { debitTx: result.debitTx, creditTx: result.creditTx } };
+    } catch (err) {
+      if (err instanceof LedgerError) {
+        return reply.status(409).send({ success: false, error: err.message });
+      }
+      throw err;
+    }
   });
 
-  // Gift code redemption
-  app.post('/redeem', { preHandler: [app.authenticate] }, async (request: any, reply) => {
-    const { code } = request.body as { code: string };
+  // Gift code redemption: implemented in Phase 9 (promotions module).
+  // Not registered yet to avoid a placeholder pretending to work.
+}
 
-    return {
-      success: true,
-      data: {
-        amount: 0,
-        message: 'Gift code redeemed successfully',
-      },
-    };
-  });
-
-  // Admin: get any user's wallet
-  app.get('/user/:userId', { preHandler: [app.adminOnly] }, async (request, reply) => {
-    const { userId } = request.params as { userId: string };
-    return {
-      success: true,
-      data: null,
-      message: `Get user ${userId} wallet not implemented yet`,
-    };
-  });
-
-  // Admin: adjust balance
-  app.post('/adjust', { preHandler: [app.adminOnly] }, async (request, reply) => {
-    const { userId, amount, reason } = request.body as {
-      userId: string;
-      amount: number;
-      reason: string;
-    };
-
-    return {
-      success: true,
-      data: null,
-      message: 'Adjust balance not implemented yet',
-    };
-  });
-
-  // Admin: ledger report
-  app.get('/ledger', { preHandler: [app.adminOnly] }, async (request, reply) => {
-    const { fromDate, toDate, userId, type } = request.query as {
-      fromDate?: string;
-      toDate?: string;
-      userId?: string;
-      type?: string;
-    };
-
-    return {
-      success: true,
-      data: {
-        entries: [],
-        summary: {
-          totalCredits: 0,
-          totalDebits: 0,
-          netBalance: 0,
-        },
-      },
-      message: 'Get ledger not implemented yet',
-    };
-  });
+function ensureWalletFor(userId: string) {
+  return ensureWallet(userId);
 }
