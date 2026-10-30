@@ -12,6 +12,7 @@ import { users, telegramIdentities, products, productPrices, subscriptions } fro
 import { eq, desc } from 'drizzle-orm';
 import { getDashboardStats } from '../modules/reporting/dashboard.js';
 import { setReportTarget, sendReport, reportTargetStatus } from '../modules/reporting/report-sink.js';
+import { adminPanelList, registerPanelActions, isPanelWizardActive, adminPanelWizardInput } from './admin-panels.js';
 
 const log = logger.child({ module: 'telegram-admin' });
 const ADMIN_ROLES = new Set(['system_owner', 'super_admin', 'operator']);
@@ -185,6 +186,7 @@ export function registerAdmin(bot: Telegraf<Context>) {
   bot.action('admin:subs', (ctx) => guard(ctx, () => adminSubs(ctx)));
   bot.action('admin:users', (ctx) => guard(ctx, () => adminUsers(ctx)));
   bot.action('admin:products', (ctx) => guard(ctx, () => adminProducts(ctx)));
+  bot.action('admin:panels', (ctx) => guard(ctx, () => adminPanelList(ctx)));
   bot.action('admin:reports', (ctx) => guard(ctx, () => adminReports(ctx)));
   bot.action('admin:system', (ctx) => guard(ctx, () => adminSystem(ctx)));
 
@@ -219,5 +221,19 @@ export function registerAdmin(bot: Telegraf<Context>) {
   bot.command('adminping', async (ctx) => {
     const admin = await getAdminUser(ctx);
     await ctx.reply(admin ? '✅ شما مدیر هستید.' : fa.admin.notAdmin);
+  });
+
+  // Panel management (list / add wizard / test / toggle / delete)
+  registerPanelActions(bot);
+
+  // Route free text into the add-panel wizard when it's active for this chat.
+  bot.on('text', async (ctx) => {
+    if (!isPanelWizardActive(ctx)) return;
+    const admin = await getAdminUser(ctx);
+    if (!admin) {
+      await ctx.reply(fa.admin.notAdmin);
+      return;
+    }
+    await adminPanelWizardInput(ctx, ctx.message.text);
   });
 }

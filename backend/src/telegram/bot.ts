@@ -13,7 +13,7 @@
 import { Telegraf, Context, TelegramError, Markup } from 'telegraf';
 import { logger } from '../core/logger/index.js';
 import { fa } from './texts.js';
-import { mainMenuKeyboard, backToMenuKeyboard, productKeyboard, paymentMethodKeyboard } from './keyboards.js';
+import { mainMenuKeyboard, backToMenuKeyboard, productKeyboard, paymentMethodKeyboard, mainMenuLabels, productDetailKeyboard } from './keyboards.js';
 import { db } from '../core/database/index.js';
 import { users, products, productPrices, wallets, telegramIdentities, subscriptions } from '../core/database/schema.js';
 import { eq, and } from 'drizzle-orm';
@@ -29,6 +29,10 @@ import { registerAdmin } from './admin.js';
 import { createOrder } from '../modules/orders/service-part1.js';
 
 const log = logger.child({ module: 'telegram-bot' });
+
+/** Bot username (set once getMe returns) — needed by menu handlers that live
+ * outside createBot() where the `bot` instance is not in scope. */
+let botUsername: string | undefined;
 
 /** Reply extra parameter accepted by Telegraf (keyboards, parse mode, …). */
 type ReplyExtra = Parameters<Context['reply']>[1];
@@ -57,6 +61,109 @@ async function safeEdit(ctx: Context, text: string, kb?: object): Promise<void> 
     else await ctx.editMessageText(text);
   } catch {
     await safeReply(ctx, text, kb as ReplyExtra);
+  }
+}
+
+/**
+ * Single source of truth for every main-menu section. Works for BOTH the reply
+ * keyboard (a plain text message → safeEdit falls back to a fresh reply) and
+ * the inline "menu:*" callbacks (edits the tapped message in place).
+ */
+async function runMenuSection(ctx: Context, key: string): Promise<void> {
+  const tgId = ctx.from?.id;
+  switch (key) {
+    case 'buy': {
+      try {
+        const rows = await db
+          .select({
+            id: products.id,
+            name: products.name,
+            price: productPrices.finalPrice,
+          })
+          .from(products)
+          .innerJoin(productPrices, eq(products.id, productPrices.productId))
+          .where(and(eq(products.isVisible, true), eq(products.isActive, true)))
+          .orderBy(products.sortOrder)
+          .limit(20);
+        if (!rows.length) {
+          await safeEdit(ctx, 'هنوز محصولی برای فروش موجود نیست.', backToMenuKeyboard());
+          return;
+        }
+        await safeEdit(ctx, fa.selectProduct, productKeyboard(rows));
+      } catch (err) {
+        log.error({ err }, 'buy menu failed');
+        await safeReply(ctx, fa.errors.generic);
+      }
+      return;
+    }
+    case 'mysubs': {
+      if (!tgId) return;
+      const subs = await db
+        .select()
+        .from(subscriptions)
+        .innerJoin(telegramIdentities, eq(subscriptions.userId, telegramIdentities.userId))
+        .where(eq(telegramIdentities.telegramId, String(tgId)));
+      if (!subs.length) {
+        await safeEdit(ctx, fa.noSubs, backToMenuKeyboard());
+        return;
+      }
+      for (const row of subs) {
+        const sub = row.subscriptions;
+        const used = sub.usedDataGb != null ? `${sub.usedDataGb.toFixed(1)} گیگابایت` : 'نامشخص';
+        const total = sub.dataLimitGb != null ? `${sub.dataLimitGb} گیگابایت` : 'نامحدود';
+        const expiry = sub.expiresAt ? sub.expiresAt.toLocaleDateString('fa-IR') : 'نامشخص';
+        await ctx.reply(fa.subscriptionDetails(sub.username ?? 'اشتراک', used, total, expiry, sub.status), backToMenuKeyboard());
+      }
+      return;
+    }
+    case 'wallet': {
+      if (!tgId) return;
+      const identity = await db.select().from(telegramIdentities).where(eq(telegramIdentities.telegramId, String(tgId))).limit(1);
+      if (!identity.length) {
+        await safeEdit(ctx, fa.noSubs, backToMenuKeyboard());
+        return;
+      }
+      const wallet = await db.select().from(wallets).where(eq(wallets.userId, identity[0].userId)).limit(1);
+      await safeEdit(ctx, fa.walletBalance(formatPrice(wallet[0]?.balance ?? 0)), backToMenuKeyboard());
+      return;
+    }
+    case 'guide': {
+      await safeEdit(ctx, fa.guide, backToMenuKeyboard());
+      return;
+    }
+    case 'renew': {
+      await safeEdit(ctx, fa.comingSoon('تمدید اشتراک'), backToMenuKeyboard());
+      return;
+    }
+    case 'trial': {
+      const trial = await db
+        .select({ id: subscriptions.id })
+        .from(subscriptions)
+        .innerJoin(telegramIdentities, eq(subscriptions.userId, telegramIdentities.userId))
+        .innerJoin(products, eq(subscriptions.productId, products.id))
+        .where(and(eq(telegramIdentities.telegramId, String(ctx.from?.id ?? '')), eq(products.type, 'trial')))
+        .limit(1)
+        .catch(() => [] as any[]);
+      if (trial.length) await safeEdit(ctx, fa.trialUsed, backToMenuKeyboard());
+      else await safeEdit(ctx, fa.trialAvailable, backToMenuKeyboard());
+      return;
+    }
+    case 'referral': {
+      const uname = botUsername;
+      const link = uname ? `https://t.me/${uname}?start=ref_${String(ctx.from?.id ?? '')}` : '—';
+      if (!uname) {
+        await safeEdit(ctx, fa.referralInfo('—', 0, '1,000'), backToMenuKeyboard());
+        return;
+      }
+      await safeEdit(ctx, fa.referralInfo(link, 0, '1,000'), backToMenuKeyboard());
+      return;
+    }
+    case 'support': {
+      await safeEdit(ctx, fa.supportInfo(process.env.TELEGRAM_BOT_SUPPORT_USERNAME), backToMenuKeyboard());
+      return;
+    }
+    default:
+      await safeEdit(ctx, fa.welcome, mainMenuKeyboard());
   }
 }
 
@@ -102,37 +209,37 @@ function createBot(token: string): Telegraf<Context> {
     }
   });
 
-  // Main menu callback
+  // Main menu callback (inline "back" path) — re-send welcome with the reply menu
   bot.action('menu:main', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(fa.welcome, mainMenuKeyboard());
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.reply(fa.welcome, mainMenuKeyboard());
   });
 
-  // Buy flow
-  bot.action('menu:buy', async (ctx) => {
-    await ctx.answerCbQuery();
-    try {
-      const rows = await db
-        .select({
-          id: products.id,
-          name: products.name,
-          price: productPrices.finalPrice,
-        })
-        .from(products)
-        .innerJoin(productPrices, eq(products.id, productPrices.productId))
-        .where(and(eq(products.isVisible, true), eq(products.isActive, true)))
-        .orderBy(products.sortOrder)
-        .limit(20);
+  // Reply-keyboard routing: the persistent menu sends its label text, so map
+  // each label to the same named handler used by the inline callbacks below.
+  bot.hears(mainMenuLabels, async (ctx) => {
+    const { text } = ctx.message as { text?: string };
+    const label = text ?? '';
+    const key =
+      label === fa.mainMenu.buy ? 'buy'
+      : label === fa.mainMenu.mySubs ? 'mysubs'
+      : label === fa.mainMenu.wallet ? 'wallet'
+      : label === fa.mainMenu.renew ? 'renew'
+      : label === fa.mainMenu.trial ? 'trial'
+      : label === fa.mainMenu.referral ? 'referral'
+      : label === fa.mainMenu.guide ? 'guide'
+      : label === fa.mainMenu.support ? 'support'
+      : null;
+    // Answer inline buttons stay on their message; reply-keyboard taps answer
+    // by replying (the inline handlers below share these named functions).
+    if (key) await runMenuSection(ctx, key);
+  });
 
-      if (!rows.length) {
-        await ctx.editMessageText('هنوز محصولی برای فروش موجود نیست.', backToMenuKeyboard());
-        return;
-      }
-      await ctx.editMessageText(fa.selectProduct, productKeyboard(rows));
-    } catch (err) {
-      log.error({ err }, 'buy menu failed');
-      await ctx.reply(fa.errors.generic);
-    }
+  // Buy flow (inline "menu:buy" — kept for old inline messages; reply-keyboard
+  // users reach the same logic via bot.hears → runMenuSection).
+  bot.action('menu:buy', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await runMenuSection(ctx, 'buy');
   });
 
   // Product detail chosen from the list
@@ -160,10 +267,7 @@ function createBot(token: string): Telegraf<Context> {
       const p = rows[0];
       const duration = p.durationDays ? `${p.durationDays} روز` : null;
       const detail = fa.productDetails(p.name, p.price.toLocaleString('fa-IR'), p.description ?? '', duration);
-      await safeEdit(ctx, detail, Markup.inlineKeyboard([
-        [Markup.button.callback('💳 خرید این پلن', `buy:${p.id}`)],
-        [Markup.button.callback('🔙 بازگشت', 'menu:buy')],
-      ]));
+      await safeEdit(ctx, detail, productDetailKeyboard(p.id));
     } catch (err) {
       log.error({ err: err instanceof Error ? err.message : String(err) }, 'product detail failed');
       await safeEdit(ctx, fa.errors.generic, backToMenuKeyboard());
@@ -195,81 +299,44 @@ function createBot(token: string): Telegraf<Context> {
 
   // My subscriptions
   bot.action('menu:mysubs', async (ctx) => {
-    await ctx.answerCbQuery();
-    const tgId = ctx.from?.id;
-    if (!tgId) return;
-    const subs = await db
-      .select()
-      .from(subscriptions)
-      .innerJoin(telegramIdentities, eq(subscriptions.userId, telegramIdentities.userId))
-      .where(eq(telegramIdentities.telegramId, String(tgId)));
-    if (!subs.length) {
-      await ctx.editMessageText(fa.noSubs, backToMenuKeyboard());
-      return;
-    }
-    for (const row of subs) {
-      const sub = row.subscriptions;
-      const used = sub.usedDataGb != null ? `${sub.usedDataGb.toFixed(1)} گیگابایت` : 'نامشخص';
-      const total = sub.dataLimitGb != null ? `${sub.dataLimitGb} گیگابایت` : 'نامحدود';
-      const expiry = sub.expiresAt ? sub.expiresAt.toLocaleDateString('fa-IR') : 'نامشخص';
-      await ctx.reply(fa.subscriptionDetails(sub.username ?? 'اشتراک', used, total, expiry, sub.status), backToMenuKeyboard());
-    }
+    await ctx.answerCbQuery().catch(() => {});
+    await runMenuSection(ctx, 'mysubs');
   });
 
   // Wallet
   bot.action('menu:wallet', async (ctx) => {
-    await ctx.answerCbQuery();
-    const tgId = ctx.from?.id;
-    if (!tgId) return;
-    const identity = await db.select().from(telegramIdentities).where(eq(telegramIdentities.telegramId, String(tgId))).limit(1);
-    if (!identity.length) {
-      await ctx.editMessageText(fa.noSubs, backToMenuKeyboard());
-      return;
-    }
-    const wallet = await db.select().from(wallets).where(eq(wallets.userId, identity[0].userId)).limit(1);
-    await ctx.editMessageText(fa.walletBalance(formatPrice(wallet[0]?.balance ?? 0)), backToMenuKeyboard());
+    await ctx.answerCbQuery().catch(() => {});
+    await runMenuSection(ctx, 'wallet');
   });
 
   // Connection guide
   bot.action('menu:guide', async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText(fa.guide, backToMenuKeyboard());
+    await ctx.answerCbQuery().catch(() => {});
+    await runMenuSection(ctx, 'guide');
   });
 
   // Renew subscriptions
   bot.action('menu:renew', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await safeEdit(ctx, fa.comingSoon('تمدید اشتراک'), backToMenuKeyboard());
+    await runMenuSection(ctx, 'renew');
   });
 
   // Trial
   bot.action('menu:trial', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    const trial = await db
-      .select({ id: subscriptions.id })
-      .from(subscriptions)
-      .innerJoin(telegramIdentities, eq(subscriptions.userId, telegramIdentities.userId))
-      .innerJoin(products, eq(subscriptions.productId, products.id))
-      .where(and(eq(telegramIdentities.telegramId, String(ctx.from?.id ?? '')), eq(products.type, 'trial')))
-      .limit(1)
-      .catch(() => [] as any[]);
-    if (trial.length) await safeEdit(ctx, fa.trialUsed, backToMenuKeyboard());
-    else await safeEdit(ctx, fa.trialAvailable, backToMenuKeyboard());
+    await runMenuSection(ctx, 'trial');
   });
 
   // Referral
   bot.action('menu:referral', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    const tgId = String(ctx.from?.id ?? '');
-    const uname = (bot.botInfo as { username?: string } | undefined)?.username;
-    const link = uname ? `https://t.me/${uname}?start=ref_${tgId}` : fa.referralInfo('—', 0, '1,000');
-    await safeEdit(ctx, uname ? fa.referralInfo(link, 0, '1,000') : link, backToMenuKeyboard());
+    await runMenuSection(ctx, 'referral');
   });
 
   // Support
   bot.action('menu:support', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await safeEdit(ctx, fa.supportInfo(process.env.TELEGRAM_BOT_SUPPORT_USERNAME), backToMenuKeyboard());
+    await runMenuSection(ctx, 'support');
   });
 
   // Admin-only command (role checked from DB, never from client)
@@ -326,6 +393,7 @@ export async function startBotPolling(
   // start polling fire-and-forget and capture any rejection.
   try {
     bot.botInfo = await bot.telegram.getMe();
+    botUsername = bot.botInfo.username ?? undefined;
     log.info('Telegram bot token verified');
     bot.launch().catch((err) => {
       const maskedError = err instanceof Error
