@@ -10,8 +10,7 @@
  * Modes: polling (enabled by TELEGRAM_POLLING=true) or disabled.
  * Webhook mode is prepared (createBotForWebhook) but not wired yet.
  */
-import { Telegraf, Context, TelegramError } from 'telegraf';
-import { message } from 'telegraf/filters';
+import { Telegraf, Context, TelegramError, Markup } from 'telegraf';
 import { logger } from '../core/logger/index.js';
 import { fa } from './texts.js';
 import { mainMenuKeyboard, backToMenuKeyboard, productKeyboard, paymentMethodKeyboard } from './keyboards.js';
@@ -25,6 +24,9 @@ import {
   isBlockedByUserError,
   type TelegramProfile,
 } from '../modules/identity/telegram-user.js';
+import { sendReport } from '../modules/reporting/report-sink.js';
+import { registerAdmin } from './admin.js';
+import { createOrder } from '../modules/orders/service-part1.js';
 
 const log = logger.child({ module: 'telegram-bot' });
 
@@ -45,6 +47,16 @@ async function safeReply(ctx: Context, text: string, extra?: ReplyExtra): Promis
       return;
     }
     log.error({ err: err instanceof Error ? err.message : String(err), tgId: ctx.from?.id }, 'Telegram send failed (handler continues)');
+  }
+}
+
+/** Edit the message in place (menu navigation); falls back to a fresh reply. Never throws. */
+async function safeEdit(ctx: Context, text: string, kb?: object): Promise<void> {
+  try {
+    if (kb) await ctx.editMessageText(text, kb as any);
+    else await ctx.editMessageText(text);
+  } catch {
+    await safeReply(ctx, text, kb as ReplyExtra);
   }
 }
 
@@ -75,8 +87,15 @@ function createBot(token: string): Telegraf<Context> {
     };
 
     try {
+      const isNew = !(await identityRepo.findIdentityByTelegramId(String(tgUser.id)));
       await findOrCreateUserFromTelegram(identityRepo, profile);
       await safeReply(ctx, fa.welcome, mainMenuKeyboard());
+      if (isNew) {
+        await sendReport(
+          bot,
+          `🆕 کاربر جدید ثبت شد\n👤 ${tgUser.first_name ?? ''} ${tgUser.last_name ?? ''}${tgUser.username ? ` (@${tgUser.username})` : ''}\n🆔 ${tgUser.id}`
+        );
+      }
     } catch (err) {
       log.error({ err: err instanceof Error ? err.message : String(err) }, 'start handler failed');
       await safeReply(ctx, fa.errors.generic);
@@ -116,6 +135,64 @@ function createBot(token: string): Telegraf<Context> {
     }
   });
 
+  // Product detail chosen from the list
+  bot.action(/product:(.+)/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const productId = ctx.match?.[1];
+    if (!productId) return;
+    try {
+      const rows = await db
+        .select({
+          id: products.id,
+          name: products.name,
+          description: products.descriptionFa ?? products.description,
+          price: productPrices.finalPrice,
+          durationDays: products.durationDays,
+        })
+        .from(products)
+        .innerJoin(productPrices, eq(products.id, productPrices.productId))
+        .where(eq(products.id, productId))
+        .limit(1);
+      if (!rows.length) {
+        await safeEdit(ctx, fa.errors.notFound, backToMenuKeyboard());
+        return;
+      }
+      const p = rows[0];
+      const duration = p.durationDays ? `${p.durationDays} روز` : null;
+      const detail = fa.productDetails(p.name, p.price.toLocaleString('fa-IR'), p.description ?? '', duration);
+      await safeEdit(ctx, detail, Markup.inlineKeyboard([
+        [Markup.button.callback('💳 خرید این پلن', `buy:${p.id}`)],
+        [Markup.button.callback('🔙 بازگشت', 'menu:buy')],
+      ]));
+    } catch (err) {
+      log.error({ err: err instanceof Error ? err.message : String(err) }, 'product detail failed');
+      await safeEdit(ctx, fa.errors.generic, backToMenuKeyboard());
+    }
+  });
+
+  // Buy the chosen product -> create order + report to topic
+  bot.action(/buy:(.+)/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const productId = ctx.match?.[1];
+    const tgId = ctx.from?.id;
+    if (!productId || !tgId) return;
+    try {
+      const userId = await findOrCreateUserFromTelegram(identityRepo, {
+        id: tgId,
+        first_name: ctx.from?.first_name,
+        last_name: ctx.from?.last_name,
+        username: ctx.from?.username,
+      });
+      await ctx.reply(fa.purchaseProcessing);
+      const orderId = await createOrder(userId, [{ productId, quantity: 1 }]);
+      await ctx.reply(fa.orderCreated(orderId));
+      await sendReport(bot, `📦 سفارش جدید ثبت شد\n🆔 ${orderId}\n👤 @${ctx.from?.username ?? tgId}\n🛒 محصول: ${productId}`);
+    } catch (err) {
+      log.error({ err: err instanceof Error ? err.message : String(err) }, 'buy failed');
+      await safeReply(ctx, fa.purchaseFailed);
+    }
+  });
+
   // My subscriptions
   bot.action('menu:mysubs', async (ctx) => {
     await ctx.answerCbQuery();
@@ -135,7 +212,7 @@ function createBot(token: string): Telegraf<Context> {
       const used = sub.usedDataGb != null ? `${sub.usedDataGb.toFixed(1)} گیگابایت` : 'نامشخص';
       const total = sub.dataLimitGb != null ? `${sub.dataLimitGb} گیگابایت` : 'نامحدود';
       const expiry = sub.expiresAt ? sub.expiresAt.toLocaleDateString('fa-IR') : 'نامشخص';
-      await ctx.reply(fa.subscriptionDetails(sub.username ?? 'اشتراک', used, total, expiry), backToMenuKeyboard());
+      await ctx.reply(fa.subscriptionDetails(sub.username ?? 'اشتراک', used, total, expiry, sub.status), backToMenuKeyboard());
     }
   });
 
@@ -159,6 +236,42 @@ function createBot(token: string): Telegraf<Context> {
     await ctx.editMessageText(fa.guide, backToMenuKeyboard());
   });
 
+  // Renew subscriptions
+  bot.action('menu:renew', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await safeEdit(ctx, fa.comingSoon('تمدید اشتراک'), backToMenuKeyboard());
+  });
+
+  // Trial
+  bot.action('menu:trial', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const trial = await db
+      .select({ id: subscriptions.id })
+      .from(subscriptions)
+      .innerJoin(telegramIdentities, eq(subscriptions.userId, telegramIdentities.userId))
+      .innerJoin(products, eq(subscriptions.productId, products.id))
+      .where(and(eq(telegramIdentities.telegramId, String(ctx.from?.id ?? '')), eq(products.type, 'trial')))
+      .limit(1)
+      .catch(() => [] as any[]);
+    if (trial.length) await safeEdit(ctx, fa.trialUsed, backToMenuKeyboard());
+    else await safeEdit(ctx, fa.trialAvailable, backToMenuKeyboard());
+  });
+
+  // Referral
+  bot.action('menu:referral', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const tgId = String(ctx.from?.id ?? '');
+    const uname = (bot.botInfo as { username?: string } | undefined)?.username;
+    const link = uname ? `https://t.me/${uname}?start=ref_${tgId}` : fa.referralInfo('—', 0, '1,000');
+    await safeEdit(ctx, uname ? fa.referralInfo(link, 0, '1,000') : link, backToMenuKeyboard());
+  });
+
+  // Support
+  bot.action('menu:support', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await safeEdit(ctx, fa.supportInfo(process.env.TELEGRAM_BOT_SUPPORT_USERNAME), backToMenuKeyboard());
+  });
+
   // Admin-only command (role checked from DB, never from client)
   bot.command('stats', async (ctx) => {
     const tgId = ctx.from?.id;
@@ -173,6 +286,9 @@ function createBot(token: string): Telegraf<Context> {
     }
     await ctx.reply('پنل مدیریت در دسترس است. از داشبورد وب استفاده کنید.');
   });
+
+  // In-bot admin panel (role-checked server-side)
+  registerAdmin(bot as unknown as import('telegraf').Telegraf<Context>);
 
   return bot;
 }
@@ -209,7 +325,7 @@ export async function startBotPolling(
   // run. Instead: verify the token first (getMe throws 401 if invalid), then
   // start polling fire-and-forget and capture any rejection.
   try {
-    await bot.telegram.getMe();
+    bot.botInfo = await bot.telegram.getMe();
     log.info('Telegram bot token verified');
     bot.launch().catch((err) => {
       const maskedError = err instanceof Error
